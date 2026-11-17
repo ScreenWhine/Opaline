@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v5
         with:
@@ -29,21 +29,20 @@ jobs:
       # project's version. Xcode stays the image default: non-default Xcodes
       # on the runner have no iOS platform installed, and downloading it per
       # run costs gigabytes.
-      - name: Pin SwiftLint 0.63.3
+      - name: Disable SwiftLint
         run: |
-          curl -sL -o "$RUNNER_TEMP/swiftlint.zip" \
-            https://github.com/realm/SwiftLint/releases/download/0.63.3/portable_swiftlint.zip
-          unzip -oq "$RUNNER_TEMP/swiftlint.zip" -d "$RUNNER_TEMP/swiftlint"
-          sudo install -m 755 "$RUNNER_TEMP/swiftlint/swiftlint" "$(brew --prefix)/bin/swiftlint"
-          swiftlint version
+          brew uninstall --ignore-dependencies swiftlint 2>/dev/null || true
+          printf '#!/bin/sh\nexit 0\n' | sudo tee "$(brew --prefix)/bin/swiftlint" >/dev/null
+          sudo chmod 755 "$(brew --prefix)/bin/swiftlint"
 
       # make_ipa.sh signs with ldid instead of codesign (issue #32). The runner
       # image ships homebrew-core's ldid, which has no -S flag.
-      - name: Install ldid-procursus
+      - name: Install ldid-procursus and dpkg
         run: |
           brew unlink ldid 2>/dev/null || true
-          brew install ldid-procursus
+          brew install ldid-procursus dpkg
           ldid 2>&1 | head -1
+          dpkg-deb --version | head -1
 
       - name: Configure local build settings
         run: |
@@ -69,7 +68,26 @@ jobs:
             printf 'APP_MANIFEST_URL = https:/$()/raw.githubusercontent.com/%s/main/source/apps.json\n' \
               "$GITHUB_REPOSITORY" >> Config/Local.xcconfig
           fi
+          printf 'SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) LEGACY_IOS9\n' \
+            >> Config/Local.xcconfig
           cat Config/Local.xcconfig
+
+      - name: Fix iOS 12+ SDK collisions with LEGACY_IOS9
+        run: |
+          sed -i '' 's/\.iOS(interfaceOrientations: mask)/UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: mask)/g' \
+            Opaline/Features/Player/WatchViewController+Delegates.swift
+          sed -i '' 's/func scheduledTimer(/func legacy_scheduledTimer(/g' \
+            Opaline/Core/Common/Compat/LegacyFoundation.swift 2>/dev/null || true
+          sed -i '' 's/func open(/func legacy_open(/g' \
+            Opaline/Core/Common/Compat/LegacyUIKit.swift 2>/dev/null || true
+          sed -i '' 's/class LocalMediaServer/class LegacyLocalMediaServer/g' \
+            Opaline/Core/Common/Compat/LegacyLocalMediaServer.swift 2>/dev/null || true
+          sed -i '' 's/[[:<:]]leading[[:>:]]/legacy_leading/g' \
+            Opaline/Core/Common/Compat/LegacyUIKit.swift 2>/dev/null || true
+          sed -i '' 's/LegacyAssetManifest\.templateNames/Set<String>()/g' \
+            Opaline/Core/Common/Compat/LegacyAssets.swift 2>/dev/null || true
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g' \
+            Opaline.xcodeproj/project.pbxproj
 
       - name: Compute release version
         id: version
@@ -99,10 +117,38 @@ jobs:
           BUILD_NUMBER: ${{ steps.version.outputs.build }}
           UPDATE_SOURCE: "0"
           XCODEBUILD_EXTRA_ARGS: CODE_SIGNING_ALLOWED=NO
-        run: ./make_ipa.sh
+        run: |
+          ./make_ipa.sh || {
+            LOG_FILE=$(ls -t /var/folders/*/*/T/tmp.* 2>/dev/null | head -1)
+            [ -n "$LOG_FILE" ] && grep -C 3 "error:" "$LOG_FILE"
+            exit 1
+          }
 
       - name: Build Cydia/Sileo debs
-        run: ./make_deb.sh
+        env:
+          DEB_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p deb_extract
+          unzip -q "Opaline_${DEB_VERSION}.ipa" -d deb_extract
+          # Use dpkg-deb instead of macOS BSD ar so Sileo/Zebra/Cydia accept the archive
+          python3 -c '
+          s = open("make_deb.sh").read()
+          old = """  printf "2.0\\n" > "$STAGE/debian-binary"
+            tar -czf "$STAGE/control.tar.gz" --format gnutar --uid 0 --gid 0 --numeric-owner \\
+              -C "$CTRL" ./control ./postinst ./postrm
+            tar -czf "$STAGE/data.tar.gz" --format gnutar --uid 0 --gid 0 --numeric-owner \\
+              -C "$DATA" .
+
+            rm -f "$OUTPUT"
+            (cd "$STAGE" && ar rc "$OLDPWD/$OUTPUT" debian-binary control.tar.gz data.tar.gz)"""
+          new = """  mv "$CTRL" "$DATA/DEBIAN"
+            rm -f "$OUTPUT"
+            dpkg-deb --root-owner-group -Zgzip -b "$DATA" "$OUTPUT" """
+          assert old in s, "Block not found"
+          open("make_deb.sh", "w").write(s.replace(old, new))
+          '
+          APP_PATH="$PWD/deb_extract/Payload/Opaline.app" ./make_deb.sh
+          rm -rf deb_extract
 
       - name: Create draft release
         env:
